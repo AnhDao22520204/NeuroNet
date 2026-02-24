@@ -14,7 +14,7 @@ Jinja2==3.1.4
 joblib==1.4.2
 kiwisolver==1.4.5
 lazy_loader==0.4
-mamba-ssm==1.2.0.post1
+# mamba-ssm==1.2.0.post1
 MarkupSafe==2.1.5
 matplotlib==3.8.4
 mne==1.7.0

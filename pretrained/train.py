@@ -248,25 +248,17 @@
 #         trainer = Trainer(augments)
 #         trainer.train()
 
-
 # -*- coding:utf-8 -*-
-import os
-import sys
-import json
-import torch
-import random
-import shutil
-import argparse
-import warnings
+import os, sys, json, torch, random, shutil, argparse, warnings
 import numpy as np
 import torch.optim as opt
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.decomposition import PCA
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import accuracy_score, f1_score
+from torch.cuda.amp import GradScaler, autocast # Tăng tốc GPU
 
-# Thêm đường dẫn gốc để nhận diện module 'models' và 'pretrained'
+# Đảm bảo nhận diện đúng cấu trúc thư mục project
 sys.path.append(os.getcwd())
 
 from models.utils import model_size
@@ -275,175 +267,144 @@ from models.neuronet.model import NeuroNet
 
 warnings.filterwarnings(action='ignore')
 
-# --- THIẾT LẬP REPRODUCIBILITY (TÍNH TÁI LẬP) ---
-random_seed = 42 # Sử dụng con số huyền thoại 42
-random.seed(random_seed)
-np.random.seed(random_seed)
-torch.manual_seed(random_seed)
-torch.cuda.manual_seed(random_seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+# --- CỐ ĐỊNH SEED ĐỂ ĐẢM BẢO TÍNH TÁI LẬP ---
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def get_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="NeuroNet Pre-training Script")
     
-    # --- ĐƯỜNG DẪN DỮ LIỆU ---
-    parser.add_argument('--npz_dir', default=r'D:\DATASETS\data\HMC\HMC_EEG_npz', help="Thư mục chứa file .npz")
-    parser.add_argument('--split_json', default=r'D:\DATASETS\data\HMC\hmc_folds.json', help="File JSON chia fold")
-    parser.add_argument('--k_splits', default=5, type=int)
-    parser.add_argument('--n_fold', default=0, type=int, help="Chỉ định fold để chạy (0-4)")
-
-    # --- THÔNG SỐ HUẤN LUYỆN ---
+    # 1. Đường dẫn dữ liệu và lưu trữ
+    parser.add_argument('--npz_dir', required=True, help="Thư mục chứa file .npz đã tiền xử lý")
+    parser.add_argument('--split_json', required=True, help="File JSON chia fold cố định")
+    parser.add_argument('--ckpt_path', default='ckpt', type=str, help="Nơi lưu mô hình trên Drive/Colab")
+    parser.add_argument('--model_name', default='NeuroNet_SSL_HMC', type=str)
+    
+    # 2. Tham số huấn luyện
+    parser.add_argument('--n_fold', default=0, type=int)
     parser.add_argument('--train_epochs', default=50, type=int)
-    parser.add_argument('--train_batch_size', default=64, type=int)
-    parser.add_argument('--train_base_learning_rate', default=1e-4, type=float)
-    parser.add_argument('--data_scaler', default=True, type=bool, help="Bật chuẩn hóa Z-score")
+    parser.add_argument('--batch_size', default=256, type=int, help="Tăng lên để tận dụng 16GB GPU RAM của Colab")
+    parser.add_argument('--lr', default=1e-4, type=float)
+    parser.add_argument('--alpha', default=1.0, type=float, help="Trọng số cân bằng Recon Loss và Contrastive Loss")
     
-    # --- CẤU HÌNH MÔ HÌNH ---
-    parser.add_argument('--input_channels', default=1, type=int, help="1 cho đơn kênh EEG, 2 cho đa kênh EEG+EOG")
-    parser.add_argument('--rfreq', default=100, type=int)
-    parser.add_argument('--second', default=30, type=int)
-    parser.add_argument('--time_window', default=3, type=int)
-    parser.add_argument('--time_step', default=0.375, type=float)
+    # 3. Tham số mô hình & SSL
+    parser.add_argument('--input_channels', default=1, type=int, help="1: EEG, 2: EEG+EOG")
+    parser.add_argument('--mask_ratio', default=0.75, type=float, help="Tỷ lệ che tín hiệu (0.75 là chuẩn MAE)")
+    parser.add_argument('--eval_interval', default=5, type=int, help="Số epoch giữa các lần chạy KNN Evaluation")
     
-    # --- SIÊU THAM SỐ SSL ---
-    parser.add_argument('--encoder_embed_dim', default=256, type=int)
-    parser.add_argument('--encoder_heads', default=8, type=int)
-    parser.add_argument('--encoder_depths', default=4, type=int)
-    parser.add_argument('--decoder_embed_dim', default=128, type=int)
-    parser.add_argument('--decoder_heads', default=4, type=int)
-    parser.add_argument('--decoder_depths', default=2, type=int)
-    parser.add_argument('--mask_ratio', default=0.75, type=float)
-    parser.add_argument('--alpha', default=1.0, type=float, help="Trọng số cho Contrastive Loss")
-
-    # --- LOGGING ---
-    parser.add_argument('--ckpt_path', default='ckpt', type=str)
-    parser.add_argument('--model_name', default='NeuroNet_Pretrain_v1')
+    # 4. Hệ thống
+    parser.add_argument('--num_workers', default=2, type=int, help="Số luồng CPU nạp dữ liệu")
     
     return parser.parse_args()
 
 class Trainer:
     def __init__(self, args):
         self.args = args
+        set_seed(42)
         
-        # 1. Khởi tạo mô hình NeuroNet
+        # Khởi tạo mô hình NeuroNet
         self.model = NeuroNet(
-            fs=args.rfreq, second=args.second, time_window=args.time_window, time_step=args.time_step,
-            encoder_embed_dim=args.encoder_embed_dim, encoder_heads=args.encoder_heads, encoder_depths=args.encoder_depths,
-            decoder_embed_dim=args.decoder_embed_dim, decoder_heads=args.decoder_heads, decoder_depths=args.decoder_depths,
+            fs=100, second=30, time_window=3, time_step=0.375,
+            encoder_embed_dim=256, encoder_heads=8, encoder_depths=4,
+            decoder_embed_dim=128, decoder_heads=4, decoder_depths=2,
             projection_hidden=[512, 256], input_channels=args.input_channels
         ).to(device)
         
-        print(f'>>> Model Initialized. Size: {model_size(self.model):.2f}MB')
+        print(f'>>> Model Size: {model_size(self.model):.2f}MB')
         
-        # 2. Bộ tối ưu
-        self.optimizer = opt.AdamW(self.model.parameters(), lr=args.train_base_learning_rate)
+        self.optimizer = opt.AdamW(self.model.parameters(), lr=args.lr)
         self.scheduler = opt.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=args.train_epochs)
-        
-        # 3. Quản lý Log và Tensorboard
+        self.scaler = GradScaler() # Khởi tạo bộ nén FP16 cho GPU
+
+        # Quản lý thư mục
         self.fold_dir = os.path.join(args.ckpt_path, args.model_name, f"fold_{args.n_fold}")
-        if os.path.exists(self.fold_dir):
-            shutil.rmtree(self.fold_dir)
-        os.makedirs(self.fold_dir, exist_ok=True)
+        self.epoch_ckpt_dir = os.path.join(self.fold_dir, "epoch_checkpoints")
+        os.makedirs(self.epoch_ckpt_dir, exist_ok=True)
         self.writer = SummaryWriter(os.path.join(self.fold_dir, 'tensorboard'))
 
     def train(self):
-        # 1. Load danh sách bệnh nhân từ JSON
-        with open(self.args.split_json, 'r') as f:
-            splits = json.load(f)
-        fold_data = splits[f"fold_{self.args.n_fold}"]
+        # Load danh sách từ file JSON đã chia
+        with open(self.args.split_json, 'r') as f: splits = json.load(f)
+        fold = splits[f"fold_{self.args.n_fold}"]
+        
+        # DataLoader tối ưu hóa tốc độ
+        train_loader = DataLoader(TorchDataset(fold['train'], self.args.npz_dir, True), 
+                                  batch_size=self.args.batch_size, shuffle=True, 
+                                  num_workers=self.args.num_workers, pin_memory=True)
+        val_loader = DataLoader(TorchDataset(fold['val'], self.args.npz_dir, True), batch_size=self.args.batch_size)
+        test_loader = DataLoader(TorchDataset(fold['test'], self.args.npz_dir, True), batch_size=self.args.batch_size)
 
-        
-        # 2. Tạo DataLoaders (Tải dữ liệu lên RAM)
-        print(">>> Loading Training Set...")
-        train_loader = DataLoader(TorchDataset(fold_data['train'], self.args.npz_dir, self.args.data_scaler), 
-                                  batch_size=self.args.train_batch_size, shuffle=True)
-        
-        print(">>> Loading Validation Set...")
-        val_loader = DataLoader(TorchDataset(fold_data['val'], self.args.npz_dir, self.args.data_scaler), 
-                                batch_size=self.args.train_batch_size)
-        
-        print(">>> Loading Test Set...")
-        test_loader = DataLoader(TorchDataset(fold_data['test'], self.args.npz_dir, self.args.data_scaler), 
-                                 batch_size=self.args.train_batch_size)
-        best_f1 = 0.0
+        self.best_f1 = 0.0
+        print(f">>> Bắt đầu huấn luyện: {len(train_loader)} batches/epoch")
 
-        # 3. Vòng lặp huấn luyện (SSL)
         for epoch in range(self.args.train_epochs):
             self.model.train()
-            total_loss, total_recon, total_cl = 0, 0, 0
+            total_loss = 0
             
-            for x, _ in train_loader:
-                x = x.to(device)
+            for step, (x, _) in enumerate(train_loader, start=1):
+                x = x.to(device, non_blocking=True)
                 self.optimizer.zero_grad()
                 
-                # Forward: Trả về Reconstruction Loss và Contrastive Loss
-                recon, cl, _ = self.model(x, self.args.mask_ratio)
-                loss = recon + self.args.alpha * cl
+                # --- SỬ DỤNG MIXED PRECISION (TĂNG TỐC 2X) ---
+                with autocast():
+                    recon, cl, _ = self.model(x, self.args.mask_ratio)
+                    loss = recon + self.args.alpha * cl
                 
-                loss.backward()
-                self.optimizer.step()
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
                 
                 total_loss += loss.item()
-                total_recon += recon.item()
-                total_cl += cl.item()
-            
-            avg_loss = total_loss / len(train_loader)
-            
-            # 4. Đánh giá chất lượng đặc trưng bằng KNN (Linear Probing)
-            acc, f1 = self.evaluate(val_loader, test_loader)
-            
-            # Logging
-            print(f"Epoch [{epoch+1}/{self.args.train_epochs}] Loss: {avg_loss:.4f} | Val Acc: {acc*100:.2f}% | Val F1: {f1*100:.2f}%")
-            self.writer.add_scalar('Loss/Train', avg_loss, epoch)
-            self.writer.add_scalar('Val/Accuracy', acc, epoch)
-            self.writer.add_scalar('Val/F1_Macro', f1, epoch)
+                if step % 20 == 0:
+                    print(f"Epoch {epoch+1} | Batch {step}/{len(train_loader)} | Loss: {loss.item():.4f}")
 
-            # Lưu mô hình tốt nhất dựa trên F1-score
-            if f1 > best_f1:
-                best_f1 = f1
-                self.save_checkpoint(epoch, f1)
+            # Đánh giá KNN định kỳ (Để tiết kiệm thời gian)
+            if (epoch + 1) % self.args.eval_interval == 0 or epoch == 0:
+                acc, f1 = self.evaluate(val_loader, test_loader)
+                print(f"--- [EVAL] Epoch {epoch+1}: Acc {acc*100:.2f}% | F1 {f1*100:.2f}% ---")
+                
+                self.writer.add_scalar('Val/F1', f1, epoch)
+                is_best = (f1 > self.best_f1)
+                if is_best: self.best_f1 = f1
+                self.save_checkpoint(epoch + 1, f1, is_best)
 
             self.scheduler.step()
 
     def evaluate(self, val_loader, test_loader):
-        """Trích xuất vector tiềm ẩn và phân loại thử bằng KNN để đo chất lượng học SSL."""
+        """Đánh giá chất lượng đặc trưng bằng thuật toán KNN Probing."""
         self.model.eval()
         def extract(loader):
             feats, labs = [], []
             with torch.no_grad():
                 for x, y in loader:
-                    # forward_latent lấy CLS token từ Encoder
                     z = self.model.forward_latent(x.to(device))
                     feats.append(z.cpu().numpy())
                     labs.append(y.numpy())
-            return np.concatenate(feats), np.concatenate(labs)
+            # Chỉ lấy 10,000 mẫu để KNN chạy nhanh (đủ để đại diện phân phối)
+            return np.concatenate(feats)[:10000], np.concatenate(labs)[:10000]
 
-        vx, vy = extract(val_loader)
-        tx, ty = extract(test_loader)
-        
-        # Dùng KNN (K=5) để phân loại 5 lớp Stage
-        knn = KNeighborsClassifier(n_neighbors=5).fit(vx, vy)
+        vx, vy = extract(val_loader); tx, ty = extract(test_loader)
+        knn = KNeighborsClassifier(n_neighbors=5, n_jobs=-1).fit(vx, vy)
         preds = knn.predict(tx)
-        
         return accuracy_score(ty, preds), f1_score(ty, preds, average='macro')
 
-    def save_checkpoint(self, epoch, score):
-        path = os.path.join(self.fold_dir, 'best_pretrain_model.pth')
-        torch.save({
-            'epoch': epoch,
-            'model_state': self.model.state_dict(),
-            'score': score,
-            'args': self.args
-        }, path)
-        print(f"--- Saved Best Model to {path} ---")
+    def save_checkpoint(self, epoch, score, is_best):
+        state = {'epoch': epoch, 'model_state': self.model.state_dict(), 
+                 'optimizer_state': self.optimizer.state_dict(), 'score': score}
+        
+        # Lưu file epoch hiện tại
+        torch.save(state, os.path.join(self.epoch_ckpt_dir, f"checkpoint_epoch_{epoch}.pth"))
+        # Lưu file tốt nhất
+        if is_best:
+            torch.save(state, os.path.join(self.fold_dir, "best_model.pth"))
+            print(f"🌟 Đã cập nhật mô hình tốt nhất tại Epoch {epoch}")
 
 if __name__ == '__main__':
-    args = get_args()
-    
-    # Bạn có thể chọn chạy 1 fold duy nhất hoặc chạy vòng lặp 5 fold
-    # Ở đây mặc định chạy n_fold được truyền vào từ tham số
-    trainer = Trainer(args)
-    trainer.train()
+    Trainer(get_args()).train()

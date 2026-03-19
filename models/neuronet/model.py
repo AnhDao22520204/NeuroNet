@@ -343,13 +343,13 @@ class NeuroNet(nn.Module):
         self.time_window = time_window
         self.time_step = time_step
 
-        # 1. Tính toán chính xác số lượng patches (khung hình) để khớp với hàm make_frame
+        # 1. Tính toán chính xác số lượng patches (khung hình) 
         step = int(self.time_step * self.fs)
         win = int(self.time_window * self.fs)
         total_samples = self.fs * self.second
         self.num_patches = len([i for i in range(0, total_samples, step) if i + win <= total_samples])
         
-        print(f"[Model Init] Thực tế có {self.num_patches} patches được tạo ra mỗi epoch 30s.")
+        print(f"[Model Init] Cấu hình: {input_channels} kênh | {self.num_patches} patches.")
 
         # 2. Khởi tạo các thành phần mô hình
         self.frame_backbone = FrameBackBone(fs=self.fs, window=self.time_window, input_channel=input_channels)
@@ -378,69 +378,46 @@ class NeuroNet(nn.Module):
         self.projectors = nn.Sequential(*project_layers)
 
     def make_frame(self, x):
-        """Cắt tín hiệu 30s thành các khung hình nhỏ (frames)"""
-        # x shape: (batch, channels, 3000)
-        step = int(self.time_step * self.fs)
-        win = int(self.time_window * self.fs)
+        step, win = int(self.time_step * self.fs), int(self.time_window * self.fs)
         total_samples = self.fs * self.second
-        
         frames = []
         for i in range(0, total_samples, step):
             if i + win <= total_samples:
                 frames.append(x[..., i:i+win])
-        
-        # Output: (batch, n_frames, channels, win)
         return torch.stack(frames, dim=1)
 
     def forward(self, x: torch.Tensor, mask_ratio: float = 0.5):
-        # x: (batch, channels, 3000)
-        x = self.make_frame(x)          # -> (batch, 73, channels, 300)
-        x = self.frame_backbone(x)      # -> (batch, 73, feature_num)
+        x = self.make_frame(x)
+        x = self.frame_backbone(x)
 
-        # Giai đoạn SSL 1: Masked Prediction (MAE)
         latent1, pred1, mask1 = self.autoencoder(x, mask_ratio)
         latent2, pred2, mask2 = self.autoencoder(x, mask_ratio)
         
-        # Tính Reconstruction Loss (Vẽ lại tín hiệu bị mất)
-        recon_loss1 = self.mae_loss(x, pred1, mask1)
-        recon_loss2 = self.mae_loss(x, pred2, mask2)
-        recon_loss = (recon_loss1 + recon_loss2) / 2
-
-        # Giai đoạn SSL 2: Contrastive Learning (Học đối sánh)
-        # Lấy CLS Token đại diện cho toàn bộ epoch
+        recon_loss = (self.mae_loss(x, pred1, mask1) + self.mae_loss(x, pred2, mask2)) / 2
         o1, o2 = latent1[:, 0, :], latent2[:, 0, :] 
         o1, o2 = self.projectors(o1), self.projectors(o2)
-        
         cl_loss, (labels, logits) = self.contrastive_loss(o1, o2)
         
         return recon_loss, cl_loss, (labels, logits)
 
     def mae_loss(self, real, pred, mask):
-        """Hàm tính lỗi tái tạo tín hiệu"""
         loss = (pred - real) ** 2
-        loss = loss.mean(dim=-1) # mean trên chiều feature
-        return (loss * mask).sum() / mask.sum()
+        return (loss.mean(dim=-1) * mask).sum() / mask.sum()
 
     def forward_latent(self, x: torch.Tensor):
-        """Hàm lấy vector đặc trưng để đánh giá KNN hoặc dùng cho bài toán hạ nguồn"""
         x = self.make_frame(x)
         x = self.frame_backbone(x)
-        # mask_ratio=0 để lấy toàn bộ thông tin
         latent, _, _ = self.autoencoder.forward_encoder(x, mask_ratio=0)
-        return latent[:, 0, :] # Trả về CLS token (đặc trưng toàn cục)
-
+        return latent[:, 0, :] 
 
 class MaskedAutoEncoderViT(nn.Module):
     def __init__(self, input_size: int, num_patches: int,
                  encoder_embed_dim: int, encoder_heads: int, encoder_depths: int,
                  decoder_embed_dim: int, decoder_heads: int, decoder_depths: int):
         super().__init__()
-        
         self.num_patches = num_patches
         self.patch_embed = nn.Linear(input_size, encoder_embed_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, encoder_embed_dim))
-        
-        # MAE Encoder
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, encoder_embed_dim), requires_grad=False)
         self.encoder_block = nn.ModuleList([
             Block(encoder_embed_dim, encoder_heads, 4., qkv_bias=True, norm_layer=nn.LayerNorm)
@@ -448,7 +425,6 @@ class MaskedAutoEncoderViT(nn.Module):
         ])
         self.encoder_norm = nn.LayerNorm(encoder_embed_dim)
 
-        # MAE Decoder
         self.decoder_embed = nn.Linear(encoder_embed_dim, decoder_embed_dim)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)
@@ -458,17 +434,13 @@ class MaskedAutoEncoderViT(nn.Module):
         ])
         self.decoder_norm = nn.LayerNorm(decoder_embed_dim)
         self.decoder_pred = nn.Linear(decoder_embed_dim, input_size)
-        
         self.initialize_weights()
 
     def initialize_weights(self):
-        # Khởi tạo vector vị trí bằng sin-cos (Flexible cho mọi số lượng patches)
         pos_embed = get_2d_sincos_pos_embed_flexible(self.pos_embed.shape[-1], (self.num_patches, 1), cls_token=True)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
         dec_pos_embed = get_2d_sincos_pos_embed_flexible(self.decoder_pos_embed.shape[-1], (self.num_patches, 1), cls_token=True)
         self.decoder_pos_embed.data.copy_(torch.from_numpy(dec_pos_embed).float().unsqueeze(0))
-
         torch.nn.init.normal_(self.cls_token, std=.02)
         torch.nn.init.normal_(self.mask_token, std=.02)
         self.apply(self._init_weights)
@@ -484,57 +456,71 @@ class MaskedAutoEncoderViT(nn.Module):
     def random_masking(self, x, mask_ratio):
         N, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
-        
-        noise = torch.rand(N, L, device=x.device)
-        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_shuffle = torch.argsort(torch.rand(N, L, device=x.device), dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
-
-        ids_keep = ids_shuffle[:, :len_keep]
-        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-
-        mask = torch.ones([N, L], device=x.device)
-        mask[:, :len_keep] = 0
+        x_masked = torch.gather(x, dim=1, index=ids_shuffle[:, :len_keep].unsqueeze(-1).repeat(1, 1, D))
+        mask = torch.ones([N, L], device=x.device); mask[:, :len_keep] = 0
         mask = torch.gather(mask, dim=1, index=ids_restore)
-
         return x_masked, mask, ids_restore
 
     def forward_encoder(self, x, mask_ratio):
-        x = self.patch_embed(x)
-        x = x + self.pos_embed[:, 1:, :]
-        
+        x = self.patch_embed(x) + self.pos_embed[:, 1:, :]
         if mask_ratio > 0:
             x, mask, ids_restore = self.random_masking(x, mask_ratio)
         else:
             mask, ids_restore = None, None
-
-        cls_token = self.cls_token + self.pos_embed[:, :1, :]
-        x = torch.cat((cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-
-        for block in self.encoder_block:
-            x = block(x)
-        x = self.encoder_norm(x)
-        return x, mask, ids_restore
+        x = torch.cat(( (self.cls_token + self.pos_embed[:, :1, :]).expand(x.shape[0], -1, -1), x), dim=1)
+        for block in self.encoder_block: x = block(x)
+        return self.encoder_norm(x), mask, ids_restore
 
     def forward_decoder(self, x, ids_restore):
         x = self.decoder_embed(x)
-
-        # Bỏ CLS token để xử lý masking
         mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
-        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)
-        x = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
-
-        # Thêm lại CLS token và vector vị trí decoder
-        x = torch.cat([x[:, :1, :], x], dim=1) 
-        x = x + self.decoder_pos_embed
-
-        for block in self.decoder_block:
-            x = block(x)
-        x = self.decoder_norm(x)
-        
-        # Dự đoán lại patches gốc (không lấy CLS token)
-        return self.decoder_pred(x[:, 1:, :])
+        x_unshuffle = torch.gather(torch.cat([x[:, 1:, :], mask_tokens], dim=1), dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
+        x = torch.cat([x[:, :1, :], x_unshuffle], dim=1) + self.decoder_pos_embed
+        for block in self.decoder_block: x = block(x)
+        return self.decoder_pred(self.decoder_norm(x)[:, 1:, :])
 
     def forward(self, x, mask_ratio=0.8):
         latent, mask, ids_restore = self.forward_encoder(x, mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)
         return latent, pred, mask
+
+# =================================================================
+# CLASS WRAPPER PHỤC VỤ FINE-TUNING (CẦN THIẾT CHO FILE fine_tuning.py)
+# =================================================================
+class NeuroNetEncoderWrapper(nn.Module):
+    def __init__(self, fs: int, second: int, time_window: int, time_step: float,
+                 frame_backbone, patch_embed, encoder_block, encoder_norm, cls_token, pos_embed,
+                 final_length):
+        super().__init__()
+        self.fs, self.second = fs, second
+        self.time_window, self.time_step = time_window, time_step
+        self.frame_backbone = frame_backbone
+        self.patch_embed = patch_embed
+        self.encoder_block = encoder_block
+        self.encoder_norm = encoder_norm
+        self.cls_token = cls_token
+        self.pos_embed = pos_embed
+        self.final_length = final_length
+
+    def make_frame(self, x):
+        step, win = int(self.time_step * self.fs), int(self.time_window * self.fs)
+        total_samples = self.fs * self.second
+        frames = []
+        for i in range(0, total_samples, step):
+            if i + win <= total_samples:
+                frames.append(x[..., i:i+win])
+        return torch.stack(frames, dim=1)
+
+    def forward(self, x):
+        # Đầu vào x: (batch, channels, 3000)
+        x = self.make_frame(x)
+        x = self.frame_backbone(x)
+        x = self.patch_embed(x)
+        x = x + self.pos_embed[:, 1:, :]
+        cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        x = torch.cat((cls_token.expand(x.shape[0], -1, -1), x), dim=1)
+        for block in self.encoder_block: x = block(x)
+        x = self.encoder_norm(x)
+        return x[:, 0, :] # Trả về CLS Token (đặc trưng 256 chiều)

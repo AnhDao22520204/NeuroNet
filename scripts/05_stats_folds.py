@@ -11,7 +11,9 @@ def get_stats_for_list(subj_list, npz_dir):
     total_epochs = 0
     
     for sid in subj_list:
-        path = os.path.join(npz_dir, f"{sid}.npz")
+        # sid có thể là "SN002" hoặc "SN002.npz"
+        fname = sid if sid.endswith(".npz") else f"{sid}.npz"
+        path = os.path.join(npz_dir, fname)
         if not os.path.exists(path):
             continue
         data = np.load(path)

@@ -1,411 +1,266 @@
-# # -*- coding:utf-8 -*-
-# import os
-# import sys
-# sys.path.extend([os.path.abspath('.'), os.path.abspath('..')])
-
-# import mne
-# import torch
-# import random
-# import shutil
-# import argparse
-# import warnings
-# import numpy as np
-# import torch.optim as opt
-# from models.utils import model_size
-# from sklearn.decomposition import PCA
-# from torch.utils.tensorboard import SummaryWriter
-# from sklearn.neighbors import KNeighborsClassifier
-# from sklearn.metrics import accuracy_score, f1_score
-# from torch.utils.data import DataLoader
-# from dataset.utils import split_train_test_val_files
-# from pretrained.data_loader import TorchDataset
-# from models.neuronet.model import NeuroNet
-
-
-# warnings.filterwarnings(action='ignore')
-
-
-# random_seed = 777
-# np.random.seed(random_seed)
-# torch.manual_seed(random_seed)
-# random.seed(random_seed)
-# torch.backends.cudnn.deterministic = True
-# torch.backends.cudnn.benchmark = False
-
-# mne.set_log_level(False)
-# device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-
-# def get_args():
-#     parser = argparse.ArgumentParser()
-#     # Dataset
-#     parser.add_argument('--base_path', default=os.path.join('..', '..', '..', 'data', 'stage', 'Sleep-EDFX-2018'))
-#     parser.add_argument('--k_splits', default=5)
-#     parser.add_argument('--n_fold', default=0, choices=[0, 1, 2, 3, 4])
-
-#     # Dataset Hyperparameter
-#     parser.add_argument('--sfreq', default=100, type=int)
-#     parser.add_argument('--rfreq', default=100, type=int)
-#     parser.add_argument('--data_scaler', default=False, type=bool)
-
-#     # Train Hyperparameter
-#     parser.add_argument('--train_epochs', default=30, type=int)
-#     parser.add_argument('--train_warmup_epoch', type=int, default=100)
-#     parser.add_argument('--train_base_learning_rate', default=1e-5, type=float)
-#     parser.add_argument('--train_batch_size', default=256, type=int)
-#     parser.add_argument('--train_batch_accumulation', default=1, type=int)
-
-#     # Model Hyperparameter
-#     parser.add_argument('--second', default=30, type=int)
-#     parser.add_argument('--time_window', default=3, type=int)
-#     parser.add_argument('--time_step', default=0.375, type=int)
-
-#     #  >> 1. NeuroNet-M Hyperparameter
-#     # parser.add_argument('--encoder_dim', default=512, type=int)
-#     # parser.add_argument('--encoder_heads', default=8, type=int)
-#     # parser.add_argument('--encoder_depths', default=4, type=int)
-#     # parser.add_argument('--decoder_embed_dim', default=192, type=int)
-#     # parser.add_argument('--decoder_heads', default=8, type=int)
-#     # parser.add_argument('--decoder_depths', default=1, type=int)
-
-#     #  >> 2. NeuroNet-B Hyperparameter
-#     parser.add_argument('--encoder_embed_dim', default=768, type=int)
-#     parser.add_argument('--encoder_heads', default=8, type=int)
-#     parser.add_argument('--encoder_depths', default=4, type=int)
-#     parser.add_argument('--decoder_embed_dim', default=256, type=int)
-#     parser.add_argument('--decoder_heads', default=8, type=int)
-#     parser.add_argument('--decoder_depths', default=3, type=int)
-#     parser.add_argument('--alpha', default=1.0, type=float)
-
-#     parser.add_argument('--projection_hidden', default=[1024, 512], type=list)
-#     parser.add_argument('--temperature', default=0.05, type=float)
-#     parser.add_argument('--mask_ratio', default=0.8, type=float)
-#     parser.add_argument('--print_point', default=20, type=int)
-#     parser.add_argument('--ckpt_path', default=os.path.join('..', '..', '..', 'ckpt', 'Sleep-EDFX'), type=str)
-#     parser.add_argument('--model_name', default='mini')
-#     return parser.parse_args()
-
-
-# class Trainer(object):
-#     def __init__(self, args):
-#         self.args = args
-#         self.model = NeuroNet(
-#             fs=args.rfreq, second=args.second, time_window=args.time_window, time_step=args.time_step,
-#             encoder_embed_dim=args.encoder_embed_dim, encoder_heads=args.encoder_heads, encoder_depths=args.encoder_depths,
-#             decoder_embed_dim=args.decoder_embed_dim, decoder_heads=args.decoder_heads,
-#             decoder_depths=args.decoder_depths, projection_hidden=args.projection_hidden, temperature=args.temperature
-#         ).to(device)
-#         print('Model Size : {0:.2f}MB'.format(model_size(self.model)))
-
-#         self.eff_batch_size = self.args.train_batch_size * self.args.train_batch_accumulation
-#         self.lr = self.args.train_base_learning_rate * self.eff_batch_size / 256
-#         self.optimizer = opt.AdamW(self.model.parameters(), lr=self.lr)
-#         self.train_paths, self.val_paths, self.eval_paths = self.data_paths()
-#         self.scheduler = opt.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.args.train_epochs)
-#         self.tensorboard_path = os.path.join(self.args.ckpt_path, self.args.model_name,
-#                                              str(self.args.n_fold), 'tensorboard')
-
-#         # remote tensorboard files
-#         if os.path.exists(self.tensorboard_path):
-#             shutil.rmtree(self.tensorboard_path)
-
-#         self.tensorboard_writer = SummaryWriter(log_dir=self.tensorboard_path)
-
-#         print('Frame Size : {}'.format(self.model.num_patches))
-#         print('Leaning Rate : {0}'.format(self.lr))
-#         print('Validation Paths : {0}'.format(len(self.val_paths)))
-#         print('Evaluation Paths : {0}'.format(len(self.eval_paths)))
-
-#     def train(self):
-#         print('K-Fold : {}/{}'.format(self.args.n_fold + 1, self.args.k_splits))
-#         train_dataset = TorchDataset(paths=self.train_paths, sfreq=self.args.sfreq, rfreq=self.args.rfreq,
-#                                      scaler=self.args.data_scaler)
-#         train_dataloader = DataLoader(train_dataset, batch_size=self.args.train_batch_size, shuffle=True)
-#         val_dataset = TorchDataset(paths=self.val_paths, sfreq=self.args.sfreq, rfreq=self.args.rfreq,
-#                                    scaler=self.args.data_scaler)
-#         val_dataloader = DataLoader(val_dataset, batch_size=self.args.train_batch_size, drop_last=True)
-#         eval_dataset = TorchDataset(paths=self.eval_paths, sfreq=self.args.sfreq, rfreq=self.args.rfreq,
-#                                     scaler=self.args.data_scaler)
-#         eval_dataloader = DataLoader(eval_dataset, batch_size=self.args.train_batch_size, drop_last=True)
-
-#         total_step = 0
-#         best_model_state, best_score = self.model.state_dict(), 0
-
-#         for epoch in range(self.args.train_epochs):
-#             step = 0
-#             self.model.train()
-#             self.optimizer.zero_grad()
-
-#             for x, _ in train_dataloader:
-#                 x = x.to(device)
-#                 out = self.model(x, mask_ratio=self.args.mask_ratio)
-#                 recon_loss, contrastive_loss, (cl_labels, cl_logits) = out
-
-#                 loss = recon_loss + self.args.alpha * contrastive_loss
-#                 loss.backward()
-
-#                 if (step + 1) % self.args.train_batch_accumulation == 0:
-#                     self.optimizer.step()
-#                     self.optimizer.zero_grad()
-
-#                 if (total_step + 1) % self.args.print_point == 0:
-#                     print('[Epoch] : {0:03d}  [Step] : {1:06d}  '
-#                           '[Reconstruction Loss] : {2:02.4f}  [Contrastive Loss] : {3:02.4f}  '
-#                           '[Total Loss] : {4:02.4f}  [Contrastive Acc] : {5:02.4f}'.format(
-#                             epoch, total_step + 1, recon_loss, contrastive_loss, loss,
-#                             self.compute_metrics(cl_logits, cl_labels)))
-
-#                 self.tensorboard_writer.add_scalar('Reconstruction Loss', recon_loss, total_step)
-#                 self.tensorboard_writer.add_scalar('Contrastive loss', contrastive_loss, total_step)
-#                 self.tensorboard_writer.add_scalar('Total loss', loss, total_step)
-
-#                 step += 1
-#                 total_step += 1
-
-#             val_acc, val_mf1 = self.linear_probing(val_dataloader, eval_dataloader)
-
-#             if val_mf1 > best_score:
-#                 best_model_state = self.model.state_dict()
-#                 best_score = val_mf1
-
-#             print('[Epoch] : {0:03d} \t [Accuracy] : {1:2.4f} \t [Macro-F1] : {2:2.4f} \n'.format(
-#                 epoch, val_acc * 100, val_mf1 * 100))
-#             self.tensorboard_writer.add_scalar('Validation Accuracy', val_acc, total_step)
-#             self.tensorboard_writer.add_scalar('Validation Macro-F1', val_mf1, total_step)
-
-#             self.optimizer.step()
-#             self.scheduler.step()
-
-#         self.save_ckpt(model_state=best_model_state)
-
-#     def linear_probing(self, val_dataloader, eval_dataloader):
-#         self.model.eval()
-#         (train_x, train_y), (test_x, test_y) = self.get_latent_vector(val_dataloader), \
-#                                                self.get_latent_vector(eval_dataloader)
-#         pca = PCA(n_components=50)
-#         train_x = pca.fit_transform(train_x)
-#         test_x = pca.transform(test_x)
-
-#         model = KNeighborsClassifier()
-#         model.fit(train_x, train_y)
-
-#         out = model.predict(test_x)
-#         acc, mf1 = accuracy_score(test_y, out), f1_score(test_y, out, average='macro')
-#         self.model.train()
-#         return acc, mf1
-
-#     def get_latent_vector(self, dataloader):
-#         total_x, total_y = [], []
-#         with torch.no_grad():
-#             for data in dataloader:
-#                 x, y = data
-#                 x, y = x.to(device), y.to(device)
-#                 latent = self.model.forward_latent(x)
-#                 total_x.append(latent.detach().cpu().numpy())
-#                 total_y.append(y.detach().cpu().numpy())
-#         total_x, total_y = np.concatenate(total_x, axis=0), np.concatenate(total_y, axis=0)
-#         return total_x, total_y
-
-#     def save_ckpt(self, model_state):
-#         ckpt_path = os.path.join(self.args.ckpt_path, self.args.model_name, str(self.args.n_fold), 'model')
-#         if not os.path.exists(ckpt_path):
-#             os.makedirs(ckpt_path)
-
-#         torch.save({
-#             'model_name': 'NeuroNet',
-#             'model_state': model_state,
-#             'model_parameter': {
-#                 'fs': self.args.rfreq, 'second': self.args.second,
-#                 'time_window': self.args.time_window, 'time_step': self.args.time_step,
-#                 'encoder_embed_dim': self.args.encoder_embed_dim, 'encoder_heads': self.args.encoder_heads,
-#                 'encoder_depths': self.args.encoder_depths,
-#                 'decoder_embed_dim': self.args.decoder_embed_dim, 'decoder_heads': self.args.decoder_heads,
-#                 'decoder_depths': self.args.decoder_depths,
-#                 'projection_hidden': self.args.projection_hidden, 'temperature': self.args.temperature
-#             },
-#             'hyperparameter': self.args.__dict__,
-#             'paths': {'train_paths': self.train_paths, 'ft_paths': self.val_paths, 'eval_paths': self.eval_paths}
-#         }, os.path.join(ckpt_path, 'best_model.pth'))
-
-#     def data_paths(self):
-#         kf = split_train_test_val_files(base_path=self.args.base_path, n_splits=self.args.k_splits)
-
-#         paths = kf[self.args.n_fold]
-#         train_paths, ft_paths, eval_paths = paths['train_paths'], paths['ft_paths'], paths['eval_paths']
-#         return train_paths, ft_paths, eval_paths
-
-#     @staticmethod
-#     def compute_metrics(output, target):
-#         output = output.argmax(dim=-1)
-#         accuracy = torch.mean(torch.eq(target, output).to(torch.float32))
-#         return accuracy
-
-
-# if __name__ == '__main__':
-#     augments = get_args()
-#     for n_fold in range(augments.k_splits):
-#         augments.n_fold = n_fold
-#         trainer = Trainer(augments)
-#         trainer.train()
-
 # -*- coding:utf-8 -*-
-import os, sys, json, torch, random, shutil, argparse, warnings
+"""
+SSL pre-training for multi-channel NPZ data (JSON splits), aligned with original NeuroNet
+hyperparameters: NeuroNet-B, lr = base_lr * batch / 256, temperature 0.05, mask_ratio 0.8,
+recon = MAE1 + MAE2, linear probe: PCA(50) + KNN.
+"""
+import os
+import sys
+import json
+import random
+import shutil
+import argparse
+import warnings
+
 import numpy as np
+import torch
 import torch.optim as opt
+from sklearn.decomposition import PCA
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.neighbors import KNeighborsClassifier
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.metrics import accuracy_score, f1_score, classification_report
-from torch.cuda.amp import GradScaler, autocast 
 
-# Đảm bảo nhận diện đúng cấu trúc thư mục project khi chạy trên Kaggle/Colab
-sys.path.append(os.getcwd())
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+from models.neuronet.model import NeuroNet
 from models.utils import model_size
 from pretrained.data_loader import TorchDataset
-from models.neuronet.model import NeuroNet
 
 warnings.filterwarnings(action='ignore')
 
-def set_seed(seed=42):
+random_seed = 777
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    s = str(v).lower()
+    if s in ('yes', 'true', 't', '1'):
+        return True
+    if s in ('no', 'false', 'f', '0'):
+        return False
+    raise argparse.ArgumentTypeError(f'Boolean value expected, got {v!r}')
+
+
+def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
 
 def get_args():
-    parser = argparse.ArgumentParser(description="NeuroNet Pre-training Script")
-    # Đường dẫn
-    parser.add_argument('--npz_dir', required=True, help="Thư mục chứa file .npz")
-    parser.add_argument('--split_json', required=True, help="File JSON chia fold")
-    parser.add_argument('--ckpt_path', default='ckpt', type=str)
-    parser.add_argument('--model_name', default='NeuroNet_v1', type=str)
-    
-    # Tham số huấn luyện
-    parser.add_argument('--n_fold', default=0, type=int)
-    parser.add_argument('--train_epochs', default=50, type=int)
-    parser.add_argument('--batch_size', default=256, type=int)
-    parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--alpha', default=1.0, type=float, help="Cân bằng MAE và Contrastive Loss")
-    
-    # Cấu hình mô hình
-    parser.add_argument('--input_channels', default=1, type=int, help="1: EEG, 2: EEG+EOG")
-    parser.add_argument('--mask_ratio', default=0.75, type=float)
-    parser.add_argument('--eval_interval', default=5, type=int)
-    parser.add_argument('--num_workers', default=2, type=int)
-    
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description='NeuroNet SSL (multi-channel NPZ + JSON folds)')
+    p.add_argument('--npz_dir', required=True, help='Thư mục chứa file .npz')
+    p.add_argument('--split_json', required=True, help='File JSON chia fold (fold_0, train/val/test)')
+    p.add_argument('--ckpt_path', default='ckpt', type=str)
+    p.add_argument('--model_name', default='NeuroNet_mc', type=str)
+    p.add_argument('--n_fold', default=0, type=int)
 
-class Trainer:
+    p.add_argument('--sfreq', default=100, type=int)
+    p.add_argument('--rfreq', default=100, type=int)
+    p.add_argument('--second', default=30, type=int)
+    p.add_argument('--time_window', default=3, type=int)
+    p.add_argument('--time_step', default=0.375, type=float)
+
+    p.add_argument('--train_epochs', default=30, type=int)
+    p.add_argument('--train_base_learning_rate', default=1e-5, type=float)
+    p.add_argument('--train_batch_size', default=256, type=int)
+    p.add_argument('--train_batch_accumulation', default=1, type=int)
+
+    p.add_argument('--encoder_embed_dim', default=768, type=int)
+    p.add_argument('--encoder_heads', default=8, type=int)
+    p.add_argument('--encoder_depths', default=4, type=int)
+    p.add_argument('--decoder_embed_dim', default=256, type=int)
+    p.add_argument('--decoder_heads', default=8, type=int)
+    p.add_argument('--decoder_depths', default=3, type=int)
+    p.add_argument('--projection_hidden', nargs='+', type=int, default=[1024, 512])
+    p.add_argument('--temperature', default=0.05, type=float)
+    p.add_argument('--alpha', default=1.0, type=float)
+    p.add_argument('--mask_ratio', default=0.8, type=float)
+    p.add_argument('--input_channels', default=1, type=int, help='1: EEG đơn kênh, 2: EEG+EOG, ...')
+
+    p.add_argument('--zscore_per_epoch', type=str2bool, default=True,
+                   help='Z-score theo epoch như TorchDataset update (True = giữ hành vi cũ)')
+    p.add_argument('--eval_interval', default=1, type=int, help='Mỗi bao nhiêu epoch chạy linear probe')
+    p.add_argument('--num_workers', default=2, type=int)
+    p.add_argument('--print_point', default=20, type=int)
+    return p.parse_args()
+
+
+class Trainer(object):
     def __init__(self, args):
         self.args = args
-        set_seed(42)
-        
-        # Khởi tạo mô hình NeuroNet
-        self.model = NeuroNet(
-            fs=100, second=30, time_window=3, time_step=0.375,
-            encoder_embed_dim=256, encoder_heads=8, encoder_depths=4,
-            decoder_embed_dim=128, decoder_heads=4, decoder_depths=2,
-            projection_hidden=[512, 256], input_channels=args.input_channels
-        ).to(device)
-        
-        print(f'>>> Model Initialized. Channels: {args.input_channels} | Size: {model_size(self.model):.2f}MB')
-        
-        self.optimizer = opt.AdamW(self.model.parameters(), lr=args.lr)
-        self.scheduler = opt.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=args.train_epochs)
-        self.scaler = GradScaler() 
+        set_seed(random_seed)
 
-        # Quản lý thư mục lưu kết quả
-        self.fold_dir = os.path.join(args.ckpt_path, args.model_name, f"fold_{args.n_fold}")
+        self.model = NeuroNet(
+            fs=args.rfreq,
+            second=args.second,
+            time_window=args.time_window,
+            time_step=args.time_step,
+            encoder_embed_dim=args.encoder_embed_dim,
+            encoder_heads=args.encoder_heads,
+            encoder_depths=args.encoder_depths,
+            decoder_embed_dim=args.decoder_embed_dim,
+            decoder_heads=args.decoder_heads,
+            decoder_depths=args.decoder_depths,
+            projection_hidden=list(args.projection_hidden),
+            input_channels=args.input_channels,
+            temperature=args.temperature,
+        ).to(device)
+
+        self.eff_batch_size = args.train_batch_size * args.train_batch_accumulation
+        self.lr = args.train_base_learning_rate * self.eff_batch_size / 256
+        self.optimizer = opt.AdamW(self.model.parameters(), lr=self.lr)
+        self.scheduler = opt.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=args.train_epochs)
+
+        self.fold_dir = os.path.join(args.ckpt_path, args.model_name, f'fold_{args.n_fold}')
+        self.tensorboard_path = os.path.join(self.fold_dir, 'tensorboard')
+        if os.path.exists(self.tensorboard_path):
+            shutil.rmtree(self.tensorboard_path)
         os.makedirs(self.fold_dir, exist_ok=True)
-        self.writer = SummaryWriter(os.path.join(self.fold_dir, 'tensorboard'))
+        self.tensorboard_writer = SummaryWriter(log_dir=self.tensorboard_path)
+
+        print('Model Size : {:.2f} MB'.format(model_size(self.model)))
+        print('Frame (patches) : {}'.format(self.model.num_patches))
+        print('Learning rate : {:.2e} (eff_batch={})'.format(self.lr, self.eff_batch_size))
 
     def train(self):
-        with open(self.args.split_json, 'r') as f: splits = json.load(f)
-        fold = splits[f"fold_{self.args.n_fold}"]
-        
-        # Nạp dữ liệu
-        train_loader = DataLoader(TorchDataset(fold['train'], self.args.npz_dir, True), 
-                                  batch_size=self.args.batch_size, shuffle=True, 
-                                  num_workers=self.args.num_workers, pin_memory=True)
-        val_loader = DataLoader(TorchDataset(fold['val'], self.args.npz_dir, True), batch_size=self.args.batch_size)
-        test_loader = DataLoader(TorchDataset(fold['test'], self.args.npz_dir, True), batch_size=self.args.batch_size)
+        with open(self.args.split_json, 'r', encoding='utf-8') as f:
+            splits = json.load(f)
+        fold = splits[f'fold_{self.args.n_fold}']
 
-        self.best_f1 = 0.0
-        num_batches = len(train_loader)
+        z = self.args.zscore_per_epoch
+        train_loader = DataLoader(
+            TorchDataset(fold['train'], self.args.npz_dir, z),
+            batch_size=self.args.train_batch_size,
+            shuffle=True,
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            TorchDataset(fold['val'], self.args.npz_dir, z),
+            batch_size=self.args.train_batch_size,
+            drop_last=False,
+        )
+        eval_loader = DataLoader(
+            TorchDataset(fold['test'], self.args.npz_dir, z),
+            batch_size=self.args.train_batch_size,
+            drop_last=False,
+        )
+
+        total_step = 0
+        best_state = self.model.state_dict()
+        best_score = -1.0
 
         for epoch in range(self.args.train_epochs):
             self.model.train()
-            epoch_loss = 0
-            
-            for step, (x, _) in enumerate(train_loader, start=1):
-                x = x.to(device, non_blocking=True)
-                self.optimizer.zero_grad()
-                
-                # Mixed Precision để tăng tốc
-                with autocast():
-                    recon, cl, _ = self.model(x, self.args.mask_ratio)
-                    loss = recon + self.args.alpha * cl
-                
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                
-                epoch_loss += loss.item()
-                if step % 20 == 0 or step == num_batches:
-                    print(f"Epoch {epoch+1} | Batch {step}/{num_batches} | Loss: {loss.item():.4f}")
+            self.optimizer.zero_grad(set_to_none=True)
+            step = 0
 
-            # Đánh giá KNN sau mỗi eval_interval
+            for x, _ in train_loader:
+                x = x.to(device, non_blocking=True)
+                out = self.model(x, mask_ratio=self.args.mask_ratio)
+                recon_loss, contrastive_loss, (cl_labels, cl_logits) = out
+                loss = recon_loss + self.args.alpha * contrastive_loss
+                loss.backward()
+
+                if (step + 1) % self.args.train_batch_accumulation == 0:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                if (total_step + 1) % self.args.print_point == 0:
+                    acc_cl = self.compute_metrics(cl_logits, cl_labels)
+                    print(
+                        '[Epoch] {:03d} [Step] {:06d} | recon {:.4f} | contrast {:.4f} | '
+                        'total {:.4f} | cl_acc {:.4f}'.format(
+                            epoch, total_step + 1, recon_loss.item(), contrastive_loss.item(),
+                            loss.item(), acc_cl,
+                        )
+                    )
+                self.tensorboard_writer.add_scalar('train/recon', recon_loss.item(), total_step)
+                self.tensorboard_writer.add_scalar('train/contrastive', contrastive_loss.item(), total_step)
+                self.tensorboard_writer.add_scalar('train/total', loss.item(), total_step)
+
+                step += 1
+                total_step += 1
+
             if (epoch + 1) % self.args.eval_interval == 0 or epoch == 0:
-                acc, f1 = self.evaluate(val_loader, test_loader, epoch + 1)
-                self.writer.add_scalar('Val/Accuracy', acc, epoch)
-                self.writer.add_scalar('Val/F1', f1, epoch)
-                
-                # Lưu Best Model
-                if f1 > self.best_f1:
-                    self.best_f1 = f1
-                    self.save_checkpoint(epoch + 1, f1, is_best=True)
-                
-                # Luôn lưu Last Model
-                self.save_checkpoint(epoch + 1, f1, is_best=False)
+                val_acc, val_mf1 = self.linear_probing(val_loader, eval_loader)
+                if val_mf1 > best_score:
+                    best_state = self.model.state_dict()
+                    best_score = val_mf1
+                    self.save_ckpt(best_state, val_mf1, epoch)
+                print('[Epoch] {:03d} | val_acc {:.4f} | val_macro_f1 {:.4f}'.format(
+                    epoch, val_acc * 100, val_mf1 * 100))
+                self.tensorboard_writer.add_scalar('val/accuracy', val_acc, total_step)
+                self.tensorboard_writer.add_scalar('val/macro_f1', val_mf1, total_step)
 
             self.scheduler.step()
 
-    def evaluate(self, val_loader, test_loader, epoch):
+    def linear_probing(self, val_dataloader, eval_dataloader):
         self.model.eval()
-        def extract(loader):
-            feats, labs = [], []
-            with torch.no_grad():
-                for x, y in loader:
-                    z = self.model.forward_latent(x.to(device))
-                    feats.append(z.cpu().numpy())
-                    labs.append(y.numpy())
-            all_feats, all_labs = np.concatenate(feats), np.concatenate(labs)
-            limit = min(len(all_feats), 10000) # Giới hạn 10k mẫu để KNN chạy nhanh
-            return all_feats[:limit], all_labs[:limit]
+        train_x, train_y = self.get_latent_vector(val_dataloader)
+        test_x, test_y = self.get_latent_vector(eval_dataloader)
+        pca = PCA(n_components=50)
+        train_x = pca.fit_transform(train_x)
+        test_x = pca.transform(test_x)
+        knn = KNeighborsClassifier()
+        knn.fit(train_x, train_y)
+        pred = knn.predict(test_x)
+        acc = accuracy_score(test_y, pred)
+        mf1 = f1_score(test_y, pred, average='macro')
+        self.model.train()
+        return acc, mf1
 
-        vx, vy = extract(val_loader); tx, ty = extract(test_loader)
-        knn = KNeighborsClassifier(n_neighbors=5, n_jobs=-1).fit(vx, vy)
-        preds = knn.predict(tx)
-        
-        # In báo cáo chi tiết cho báo cáo khóa luận
-        print(f"\n--- [VAL REPORT] Epoch {epoch} ---")
-        stages = ['W', 'N1', 'N2', 'N3', 'REM']
-        print(classification_report(ty, preds, target_names=stages, digits=4))
-        
-        return accuracy_score(ty, preds), f1_score(ty, preds, average='macro')
+    def get_latent_vector(self, dataloader):
+        xs, ys = [], []
+        with torch.no_grad():
+            for x, y in dataloader:
+                x = x.to(device)
+                z = self.model.forward_latent(x)
+                xs.append(z.detach().cpu().numpy())
+                ys.append(y.numpy())
+        return np.concatenate(xs, axis=0), np.concatenate(ys, axis=0)
 
-    def save_checkpoint(self, epoch, score, is_best):
-        state = {'epoch': epoch, 'model_state': self.model.state_dict(), 'score': score}
-        if is_best:
-            torch.save(state, os.path.join(self.fold_dir, "best_model.pth"))
-            print(f"🌟 [BEST] Đã cập nhật mô hình tốt nhất!")
-        else:
-            torch.save(state, os.path.join(self.fold_dir, "last_checkpoint.pth"))
+    def save_ckpt(self, model_state, score, epoch, name='best_model.pth'):
+        path = os.path.join(self.fold_dir, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({
+            'model_name': 'NeuroNet',
+            'epoch': epoch,
+            'score': score,
+            'model_state': model_state,
+            'model_parameter': {
+                'fs': self.args.rfreq,
+                'second': self.args.second,
+                'time_window': self.args.time_window,
+                'time_step': self.args.time_step,
+                'encoder_embed_dim': self.args.encoder_embed_dim,
+                'encoder_heads': self.args.encoder_heads,
+                'encoder_depths': self.args.encoder_depths,
+                'decoder_embed_dim': self.args.decoder_embed_dim,
+                'decoder_heads': self.args.decoder_heads,
+                'decoder_depths': self.args.decoder_depths,
+                'projection_hidden': list(self.args.projection_hidden),
+                'temperature': self.args.temperature,
+                'input_channels': self.args.input_channels,
+            },
+            'hyperparameter': vars(self.args),
+        }, path)
+
+    @staticmethod
+    def compute_metrics(output, target):
+        pred = output.argmax(dim=-1)
+        return torch.mean((pred == target).float()).item()
+
 
 if __name__ == '__main__':
     Trainer(get_args()).train()

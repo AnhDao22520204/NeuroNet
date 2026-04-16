@@ -137,7 +137,19 @@ class Trainer(object):
     def train(self):
         with open(self.args.split_json, 'r', encoding='utf-8') as f:
             splits = json.load(f)
-        fold = splits[f'fold_{self.args.n_fold}']
+
+        # Hỗ trợ nhiều format JSON:
+        # 1) {"fold_0": {...}, "fold_1": {...}}
+        # 2) {"seed": ..., "n_splits": ..., "folds": {"fold_0": {...}}}
+        # 3) {"seed": ..., "n_splits": ..., "folds": [{...}, {...}]}
+        if isinstance(splits, dict) and "folds" in splits:
+            folds = splits["folds"]
+            if isinstance(folds, list):
+                fold = folds[self.args.n_fold]
+            else:
+                fold = folds[f'fold_{self.args.n_fold}']
+        else:
+            fold = splits[f'fold_{self.args.n_fold}']
 
         z = self.args.zscore_per_epoch
         pin = torch.cuda.is_available()

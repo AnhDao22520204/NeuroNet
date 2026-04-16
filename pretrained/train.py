@@ -89,8 +89,10 @@ def get_args():
 
     p.add_argument('--zscore_per_epoch', type=str2bool, default=True,
                    help='Z-score theo epoch như TorchDataset update (True = giữ hành vi cũ)')
-    p.add_argument('--eval_interval', default=1, type=int, help='Mỗi bao nhiêu epoch chạy linear probe')
-    p.add_argument('--num_workers', default=2, type=int)
+    p.add_argument('--eval_interval', default=5, type=int, help='Mỗi bao nhiêu epoch chạy linear probe')
+    p.add_argument('--probe_max_samples', default=10000, type=int,
+                   help='Giới hạn số mẫu dùng cho PCA+KNN để tránh quá tải RAM')
+    p.add_argument('--num_workers', default=0, type=int)
     p.add_argument('--print_point', default=20, type=int)
     return p.parse_args()
 
@@ -138,22 +140,28 @@ class Trainer(object):
         fold = splits[f'fold_{self.args.n_fold}']
 
         z = self.args.zscore_per_epoch
+        pin = torch.cuda.is_available()
+
         train_loader = DataLoader(
             TorchDataset(fold['train'], self.args.npz_dir, z),
             batch_size=self.args.train_batch_size,
             shuffle=True,
             num_workers=self.args.num_workers,
-            pin_memory=True,
+            pin_memory=pin,
         )
         val_loader = DataLoader(
             TorchDataset(fold['val'], self.args.npz_dir, z),
             batch_size=self.args.train_batch_size,
             drop_last=False,
+            num_workers=self.args.num_workers,
+            pin_memory=pin,
         )
         eval_loader = DataLoader(
             TorchDataset(fold['test'], self.args.npz_dir, z),
             batch_size=self.args.train_batch_size,
             drop_last=False,
+            num_workers=self.args.num_workers,
+            pin_memory=pin,
         )
 
         total_step = 0
@@ -167,8 +175,9 @@ class Trainer(object):
 
             for x, _ in train_loader:
                 x = x.to(device, non_blocking=True)
-                out = self.model(x, mask_ratio=self.args.mask_ratio)
-                recon_loss, contrastive_loss, (cl_labels, cl_logits) = out
+                recon_loss, contrastive_loss, (cl_labels, cl_logits) = self.model(
+                    x, mask_ratio=self.args.mask_ratio
+                )
                 loss = recon_loss + self.args.alpha * contrastive_loss
                 loss.backward()
 
@@ -209,6 +218,10 @@ class Trainer(object):
         self.model.eval()
         train_x, train_y = self.get_latent_vector(val_dataloader)
         test_x, test_y = self.get_latent_vector(eval_dataloader)
+
+        train_x, train_y = self.limit_probe_samples(train_x, train_y)
+        test_x, test_y = self.limit_probe_samples(test_x, test_y)
+
         pca = PCA(n_components=50)
         train_x = pca.fit_transform(train_x)
         test_x = pca.transform(test_x)
@@ -220,11 +233,18 @@ class Trainer(object):
         self.model.train()
         return acc, mf1
 
+    def limit_probe_samples(self, x, y):
+        max_n = self.args.probe_max_samples
+        if max_n is None or max_n <= 0 or len(y) <= max_n:
+            return x, y
+        idx = np.random.choice(len(y), size=max_n, replace=False)
+        return x[idx], y[idx]
+
     def get_latent_vector(self, dataloader):
         xs, ys = [], []
         with torch.no_grad():
             for x, y in dataloader:
-                x = x.to(device)
+                x = x.to(device, non_blocking=True)
                 z = self.model.forward_latent(x)
                 xs.append(z.detach().cpu().numpy())
                 ys.append(y.numpy())

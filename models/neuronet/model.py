@@ -74,7 +74,7 @@ class NeuroNet(nn.Module):
         x = self.make_frame(x)
         x = self.frame_backbone(x)
         latent = self.autoencoder.forward_encoder(x, mask_ratio=0)[0]
-        return latent[:, 0, :]
+        return latent[:, 0, :].contiguous()
 
     def forward_mae_loss(self, real: torch.Tensor, pred: torch.Tensor, mask: torch.Tensor):
         if self.norm_pix_loss:
@@ -98,7 +98,7 @@ class NeuroNet(nn.Module):
             sample = x[..., start_idx:end_idx]
             if sample.shape[-1] == window:
                 frame.append(sample)
-        return torch.stack(frame, dim=1)
+        return torch.stack(frame, dim=1).contiguous()
 
 
 class MaskedAutoEncoderViT(nn.Module):
@@ -260,7 +260,7 @@ class NeuroNetEncoderWrapper(nn.Module):
             sample = x[..., start_idx: end_idx]
             if sample.shape[-1] == window:
                 frame.append(sample)
-        return torch.stack(frame, dim=1)
+        return torch.stack(frame, dim=1).contiguous()
 
 
 if __name__ == '__main__':
